@@ -3,7 +3,16 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from photo2print.processing import output_paths, pdf_output_path, process_document, save_pdf, select_pdf_variant
+from photo2print.processing import (
+    merged_pdf_output_path,
+    output_paths,
+    pdf_output_path,
+    process_document,
+    reconstructed_output_path,
+    save_pdf,
+    save_pdf_pages,
+    select_pdf_variant,
+)
 
 
 def test_output_paths_use_input_stem(tmp_path):
@@ -18,12 +27,21 @@ def test_pdf_output_path_uses_input_stem(tmp_path):
     assert pdf_output_path(tmp_path / "worksheet.photo.jpg", tmp_path / "out") == tmp_path / "out" / "worksheet.photo_print.pdf"
 
 
+def test_reconstructed_output_path_uses_input_stem(tmp_path):
+    assert reconstructed_output_path(tmp_path / "worksheet.photo.jpg", tmp_path / "out") == tmp_path / "out" / "worksheet.photo_reconstructed.png"
+
+
+def test_merged_pdf_output_path_uses_output_dir(tmp_path):
+    assert merged_pdf_output_path(tmp_path / "out") == tmp_path / "out" / "merged_print.pdf"
+
+
 def test_select_pdf_variant_returns_requested_processed_image():
     processed = process_document(np.full((120, 90, 3), 235, dtype=np.uint8))
 
     assert select_pdf_variant(processed, "balanced") is processed.balanced
     assert select_pdf_variant(processed, "print-soft") is processed.print_soft
     assert select_pdf_variant(processed, "print") is processed.print
+    assert select_pdf_variant(processed, "reconstructed") is processed.reconstructed
 
 
 def test_save_pdf_writes_a4_raster_pdf(tmp_path):
@@ -39,6 +57,20 @@ def test_save_pdf_writes_a4_raster_pdf(tmp_path):
     assert b"841" in data
 
 
+def test_save_pdf_pages_writes_multiple_a4_pages(tmp_path):
+    pdf_path = tmp_path / "out" / "merged.pdf"
+    first = np.full((180, 120, 3), 255, dtype=np.uint8)
+    second = np.full((120, 180, 3), 255, dtype=np.uint8)
+    cv2.putText(first, "1", (44, 102), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(second, "2", (72, 74), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2, cv2.LINE_AA)
+
+    save_pdf_pages(pdf_path, [first, second])
+
+    data = pdf_path.read_bytes()
+    assert data.startswith(b"%PDF")
+    assert data.count(b"/Type /Page") >= 2
+
+
 def test_process_document_returns_readable_cleaned_variants():
     image = np.full((360, 260, 3), (214, 219, 184), dtype=np.uint8)
     cv2.rectangle(image, (18, 18), (242, 342), (235, 232, 205), -1)
@@ -52,10 +84,29 @@ def test_process_document_returns_readable_cleaned_variants():
     assert processed.balanced.ndim == 3
     assert processed.print_soft.ndim == 3
     assert processed.print.ndim == 3
+    assert processed.reconstructed.ndim == 3
     assert processed.balanced.mean() > image.mean()
     assert processed.print_soft.mean() > 215
     assert processed.print.mean() > 220
     assert processed.print.min() < 30
+
+
+def test_process_document_builds_reconstructed_a4_white_page():
+    image = np.full((420, 300, 3), (205, 212, 184), dtype=np.uint8)
+    cv2.rectangle(image, (26, 24), (274, 396), (236, 234, 220), -1)
+    for index, y in enumerate(range(80, 255, 34)):
+        cv2.putText(image, f"{index + 1}. 12 + {index} = ____", (48, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (45, 45, 45), 1, cv2.LINE_AA)
+    cv2.line(image, (50, 304), (230, 304), (112, 112, 112), 1, cv2.LINE_AA)
+    cv2.putText(image, "show", (178, 176), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (190, 190, 190), 1, cv2.LINE_AA)
+
+    processed = process_document(image)
+    reconstructed = cv2.cvtColor(processed.reconstructed, cv2.COLOR_BGR2GRAY)
+    height, width = reconstructed.shape
+
+    assert abs((height / width) - (297 / 210)) < 0.025
+    assert reconstructed.mean() > 246
+    assert np.count_nonzero(reconstructed < 170) > 80
+    assert np.mean(reconstructed == 255) > 0.86
 
 
 def test_process_document_preserves_tiny_faint_marks():

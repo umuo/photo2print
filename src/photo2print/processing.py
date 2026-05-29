@@ -9,7 +9,7 @@ from PIL import Image, ImageOps
 
 
 SUPPORTED_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
-PDF_VARIANTS = {"balanced", "print-soft", "print"}
+PDF_VARIANTS = {"balanced", "print-soft", "print", "reconstructed"}
 A4_SIZE_MM = (210.0, 297.0)
 
 
@@ -18,6 +18,7 @@ class ProcessedDocument:
     balanced: np.ndarray
     print_soft: np.ndarray
     print: np.ndarray
+    reconstructed: np.ndarray
 
 
 def load_image(path: Path) -> np.ndarray:
@@ -33,7 +34,21 @@ def save_image(path: Path, image: np.ndarray) -> None:
 
 
 def save_pdf(path: Path, image: np.ndarray, *, dpi: int = 300, margin_mm: float = 12.0) -> None:
+    page = _a4_pdf_page(image, dpi=dpi, margin_mm=margin_mm)
     path.parent.mkdir(parents=True, exist_ok=True)
+    page.save(path, "PDF", resolution=dpi)
+
+
+def save_pdf_pages(path: Path, images: list[np.ndarray], *, dpi: int = 300, margin_mm: float = 12.0) -> None:
+    if not images:
+        raise ValueError("expected at least one image for PDF export")
+
+    pages = [_a4_pdf_page(image, dpi=dpi, margin_mm=margin_mm) for image in images]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pages[0].save(path, "PDF", resolution=dpi, save_all=True, append_images=pages[1:])
+
+
+def _a4_pdf_page(image: np.ndarray, *, dpi: int, margin_mm: float) -> Image.Image:
     page_width, page_height = _a4_pixel_size(dpi)
     image_height, image_width = image.shape[:2]
     if image_width > image_height:
@@ -50,7 +65,7 @@ def save_pdf(path: Path, image: np.ndarray, *, dpi: int = 300, margin_mm: float 
     document = Image.fromarray(rgb).convert("RGB").resize(resized_size, Image.Resampling.LANCZOS)
     offset = ((page_width - resized_size[0]) // 2, (page_height - resized_size[1]) // 2)
     page.paste(document, offset)
-    page.save(path, "PDF", resolution=dpi)
+    return page
 
 
 def process_document(image: np.ndarray) -> ProcessedDocument:
@@ -68,10 +83,12 @@ def process_document(image: np.ndarray) -> ProcessedDocument:
     balanced = _make_balanced(normalized)
     print_soft = _make_soft_print(balanced, reference_gray=gray)
     print_ready = _make_print_ready(balanced, reference_gray=gray)
+    reconstructed = _make_reconstructed_page(gray, print_ready)
     return ProcessedDocument(
         balanced=cv2.cvtColor(balanced, cv2.COLOR_GRAY2BGR),
         print_soft=cv2.cvtColor(print_soft, cv2.COLOR_GRAY2BGR),
         print=cv2.cvtColor(print_ready, cv2.COLOR_GRAY2BGR),
+        reconstructed=cv2.cvtColor(reconstructed, cv2.COLOR_GRAY2BGR),
     )
 
 
@@ -88,6 +105,14 @@ def pdf_output_path(input_path: Path, output_dir: Path) -> Path:
     return output_dir / f"{input_path.stem}_print.pdf"
 
 
+def reconstructed_output_path(input_path: Path, output_dir: Path) -> Path:
+    return output_dir / f"{input_path.stem}_reconstructed.png"
+
+
+def merged_pdf_output_path(output_dir: Path) -> Path:
+    return output_dir / "merged_print.pdf"
+
+
 def select_pdf_variant(processed: ProcessedDocument, variant: str) -> np.ndarray:
     if variant == "balanced":
         return processed.balanced
@@ -95,6 +120,8 @@ def select_pdf_variant(processed: ProcessedDocument, variant: str) -> np.ndarray
         return processed.print_soft
     if variant == "print":
         return processed.print
+    if variant == "reconstructed":
+        return processed.reconstructed
     expected = ", ".join(sorted(PDF_VARIANTS))
     raise ValueError(f"unknown PDF variant {variant!r}; expected one of: {expected}")
 
@@ -233,6 +260,169 @@ def _make_print_ready(gray: np.ndarray, *, reference_gray: np.ndarray | None = N
         reference_gray=reference_gray,
         aggressive_blank_cleanup=True,
     )
+
+
+def _make_reconstructed_page(source_gray: np.ndarray, print_gray: np.ndarray) -> np.ndarray:
+    foreground_mask = _reconstruction_foreground_mask(source_gray, print_gray)
+    if np.count_nonzero(foreground_mask) < max(20, int(source_gray.size * 0.0005)):
+        foreground_mask = print_gray < 210
+    foreground_mask = _dominant_content_mask(foreground_mask)
+
+    bounds = _mask_bounds(foreground_mask, source_gray.shape)
+    x0, y0, x1, y1 = _expand_bounds(bounds, source_gray.shape, margin_ratio=0.065)
+
+    protected_mask = cv2.dilate(
+        foreground_mask.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    ).astype(bool)
+    rebuilt = np.full_like(print_gray, 255)
+    rebuilt[protected_mask] = np.minimum(print_gray[protected_mask], 238)
+
+    content = rebuilt[y0:y1, x0:x1]
+    target_width, target_height = _a4_canvas_size_for(content.shape[1], content.shape[0])
+    margin = max(18, round(min(target_width, target_height) * 0.07))
+    fit_width = max(1, target_width - (2 * margin))
+    fit_height = max(1, target_height - (2 * margin))
+    scale = min(fit_width / content.shape[1], fit_height / content.shape[0])
+    resized_size = (max(1, round(content.shape[1] * scale)), max(1, round(content.shape[0] * scale)))
+
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    resized = cv2.resize(content, resized_size, interpolation=interpolation)
+    canvas = np.full((target_height, target_width), 255, dtype=np.uint8)
+    offset_x = (target_width - resized_size[0]) // 2
+    offset_y = (target_height - resized_size[1]) // 2
+    canvas[offset_y : offset_y + resized_size[1], offset_x : offset_x + resized_size[0]] = resized
+    return _snap_reconstructed_background(canvas)
+
+
+def _reconstruction_foreground_mask(source_gray: np.ndarray, print_gray: np.ndarray) -> np.ndarray:
+    local_background = cv2.GaussianBlur(source_gray, (0, 0), sigmaX=9, sigmaY=9).astype(np.int16)
+    local_contrast = local_background - source_gray.astype(np.int16)
+    blackhat_small = cv2.morphologyEx(
+        source_gray,
+        cv2.MORPH_BLACKHAT,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)),
+    )
+    blackhat_large = cv2.morphologyEx(
+        source_gray,
+        cv2.MORPH_BLACKHAT,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (23, 23)),
+    )
+    blackhat = np.maximum(blackhat_small, blackhat_large)
+    thin_lines = _thin_horizontal_line_mask(source_gray)
+
+    confident_dark = (source_gray < 92) | ((print_gray < 128) & (local_contrast > 5))
+    local_text = (print_gray < 196) & ((local_contrast > 9) | (blackhat > 10))
+    faint_but_structured = (print_gray < 225) & ((local_contrast > 18) | (blackhat > 18))
+    mask = confident_dark | local_text | faint_but_structured | thin_lines
+    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8), iterations=1).astype(bool)
+    return _remove_reconstruction_noise(mask)
+
+
+def _remove_reconstruction_noise(mask: np.ndarray) -> np.ndarray:
+    result = np.zeros_like(mask, dtype=np.uint8)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    for label in range(1, component_count):
+        x, y, width, height, area = stats[label]
+        if area <= 1:
+            continue
+        if area <= 3 and width <= 2 and height <= 2:
+            continue
+        if area > mask.size * 0.25:
+            continue
+        if height > mask.shape[0] * 0.45 and width < mask.shape[1] * 0.18:
+            continue
+        result[labels == label] = 1
+    return result.astype(bool)
+
+
+def _dominant_content_mask(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    column_counts = mask.sum(axis=0)
+    active_columns = column_counts > max(10, round(height * 0.03))
+    ranges = _active_ranges(active_columns)
+    candidates = []
+    for x0, x1 in ranges:
+        band_width = x1 - x0
+        if band_width < max(24, round(width * 0.18)):
+            continue
+        ink = int(column_counts[x0:x1].sum())
+        candidates.append((ink * band_width, x0, x1))
+
+    if not candidates:
+        return mask
+
+    _, x0, x1 = max(candidates)
+    pad = max(12, round(width * 0.04))
+    padded_x0 = max(0, x0 - pad)
+    padded_x1 = min(width, x1 + pad)
+    result = np.zeros_like(mask, dtype=bool)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    for label in range(1, component_count):
+        component_x, _, component_width, _, _ = stats[label]
+        component_x1 = component_x + component_width
+        intersects_core = component_x < x1 and component_x1 > x0
+        inside_padded_range = component_x1 > padded_x0 and component_x < padded_x1
+        if intersects_core and inside_padded_range:
+            result[labels == label] = True
+    return result
+
+
+def _active_ranges(active: np.ndarray) -> list[tuple[int, int]]:
+    ranges = []
+    start = None
+    for index, is_active in enumerate(active):
+        if is_active and start is None:
+            start = index
+        if (not is_active or index == len(active) - 1) and start is not None:
+            end = index if not is_active else index + 1
+            ranges.append((start, end))
+            start = None
+    return ranges
+
+
+def _mask_bounds(mask: np.ndarray, fallback_shape: tuple[int, int]) -> tuple[int, int, int, int]:
+    ys, xs = np.where(mask)
+    if len(xs) == 0 or len(ys) == 0:
+        height, width = fallback_shape
+        return (0, 0, width, height)
+    return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
+def _expand_bounds(
+    bounds: tuple[int, int, int, int],
+    shape: tuple[int, int],
+    *,
+    margin_ratio: float,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = bounds
+    height, width = shape
+    margin = max(8, round(max(x1 - x0, y1 - y0) * margin_ratio))
+    return (
+        max(0, x0 - margin),
+        max(0, y0 - margin),
+        min(width, x1 + margin),
+        min(height, y1 + margin),
+    )
+
+
+def _a4_canvas_size_for(content_width: int, content_height: int) -> tuple[int, int]:
+    portrait_ratio = A4_SIZE_MM[1] / A4_SIZE_MM[0]
+    if content_width > content_height:
+        target_width = max(content_width, round(content_height * portrait_ratio))
+        target_height = max(content_height, round(target_width / portrait_ratio))
+    else:
+        target_height = max(content_height, round(content_width * portrait_ratio))
+        target_width = max(content_width, round(target_height / portrait_ratio))
+    return (target_width, target_height)
+
+
+def _snap_reconstructed_background(gray: np.ndarray) -> np.ndarray:
+    result = gray.copy()
+    result[result > 236] = 255
+    result[(result > 218) & (result <= 236)] = np.maximum(result[(result > 218) & (result <= 236)], 246)
+    return result
 
 
 def _compose_text_protected_print(
