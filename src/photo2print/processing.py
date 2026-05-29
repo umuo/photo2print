@@ -9,6 +9,8 @@ from PIL import Image, ImageOps
 
 
 SUPPORTED_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+PDF_VARIANTS = {"balanced", "print-soft", "print"}
+A4_SIZE_MM = (210.0, 297.0)
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,27 @@ def save_image(path: Path, image: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image.ndim == 3 else image
     Image.fromarray(rgb).save(path, quality=95)
+
+
+def save_pdf(path: Path, image: np.ndarray, *, dpi: int = 300, margin_mm: float = 12.0) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    page_width, page_height = _a4_pixel_size(dpi)
+    image_height, image_width = image.shape[:2]
+    if image_width > image_height:
+        page_width, page_height = page_height, page_width
+
+    margin_px = round(margin_mm * dpi / 25.4)
+    content_width = max(1, page_width - (2 * margin_px))
+    content_height = max(1, page_height - (2 * margin_px))
+    scale = min(content_width / image_width, content_height / image_height)
+    resized_size = (max(1, round(image_width * scale)), max(1, round(image_height * scale)))
+
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image.ndim == 3 else image
+    page = Image.new("RGB", (page_width, page_height), "white")
+    document = Image.fromarray(rgb).convert("RGB").resize(resized_size, Image.Resampling.LANCZOS)
+    offset = ((page_width - resized_size[0]) // 2, (page_height - resized_size[1]) // 2)
+    page.paste(document, offset)
+    page.save(path, "PDF", resolution=dpi)
 
 
 def process_document(image: np.ndarray) -> ProcessedDocument:
@@ -59,6 +82,26 @@ def output_paths(input_path: Path, output_dir: Path) -> tuple[Path, Path, Path]:
         output_dir / f"{stem}_print_soft.png",
         output_dir / f"{stem}_print.png",
     )
+
+
+def pdf_output_path(input_path: Path, output_dir: Path) -> Path:
+    return output_dir / f"{input_path.stem}_print.pdf"
+
+
+def select_pdf_variant(processed: ProcessedDocument, variant: str) -> np.ndarray:
+    if variant == "balanced":
+        return processed.balanced
+    if variant == "print-soft":
+        return processed.print_soft
+    if variant == "print":
+        return processed.print
+    expected = ", ".join(sorted(PDF_VARIANTS))
+    raise ValueError(f"unknown PDF variant {variant!r}; expected one of: {expected}")
+
+
+def _a4_pixel_size(dpi: int) -> tuple[int, int]:
+    width_mm, height_mm = A4_SIZE_MM
+    return (round(width_mm * dpi / 25.4), round(height_mm * dpi / 25.4))
 
 
 def _correct_perspective_conservatively(image: np.ndarray) -> np.ndarray:

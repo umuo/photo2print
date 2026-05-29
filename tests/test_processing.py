@@ -3,7 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from photo2print.processing import output_paths, process_document
+from photo2print.processing import output_paths, pdf_output_path, process_document, save_pdf, select_pdf_variant
 
 
 def test_output_paths_use_input_stem(tmp_path):
@@ -12,6 +12,31 @@ def test_output_paths_use_input_stem(tmp_path):
     assert balanced == tmp_path / "out" / "worksheet.photo_balanced.png"
     assert print_soft == tmp_path / "out" / "worksheet.photo_print_soft.png"
     assert print_ready == tmp_path / "out" / "worksheet.photo_print.png"
+
+
+def test_pdf_output_path_uses_input_stem(tmp_path):
+    assert pdf_output_path(tmp_path / "worksheet.photo.jpg", tmp_path / "out") == tmp_path / "out" / "worksheet.photo_print.pdf"
+
+
+def test_select_pdf_variant_returns_requested_processed_image():
+    processed = process_document(np.full((120, 90, 3), 235, dtype=np.uint8))
+
+    assert select_pdf_variant(processed, "balanced") is processed.balanced
+    assert select_pdf_variant(processed, "print-soft") is processed.print_soft
+    assert select_pdf_variant(processed, "print") is processed.print
+
+
+def test_save_pdf_writes_a4_raster_pdf(tmp_path):
+    pdf_path = tmp_path / "out" / "page.pdf"
+    image = np.full((180, 120, 3), 255, dtype=np.uint8)
+    cv2.putText(image, "A4", (24, 94), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 2, cv2.LINE_AA)
+
+    save_pdf(pdf_path, image)
+
+    data = pdf_path.read_bytes()
+    assert data.startswith(b"%PDF")
+    assert b"/MediaBox [ 0 0 595" in data
+    assert b"841" in data
 
 
 def test_process_document_returns_readable_cleaned_variants():

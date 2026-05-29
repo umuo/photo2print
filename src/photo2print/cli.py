@@ -3,7 +3,17 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .processing import SUPPORTED_EXTENSIONS, load_image, output_paths, process_document, save_image
+from .processing import (
+    PDF_VARIANTS,
+    SUPPORTED_EXTENSIONS,
+    load_image,
+    output_paths,
+    pdf_output_path,
+    process_document,
+    save_image,
+    save_pdf,
+    select_pdf_variant,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,6 +28,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("outputs"),
         help="Directory for generated PNG files. Defaults to ./outputs.",
+    )
+    parser.add_argument(
+        "--no-pdf",
+        action="store_true",
+        help="Skip the default printable PDF export.",
+    )
+    parser.add_argument(
+        "--pdf-variant",
+        choices=sorted(PDF_VARIANTS),
+        default="print",
+        help="Processed variant to place in the PDF. Defaults to print.",
     )
     return parser
 
@@ -40,7 +61,12 @@ def main(argv: list[str] | None = None) -> None:
     save_image(balanced_path, processed.balanced)
     save_image(print_soft_path, processed.print_soft)
     save_image(print_path, processed.print)
+    pdf_path = pdf_output_path(image_path, output_dir)
+    if not args.no_pdf:
+        save_pdf(pdf_path, select_pdf_variant(processed, args.pdf_variant))
 
     print(f"Wrote balanced image: {balanced_path}")
     print(f"Wrote soft print image: {print_soft_path}")
     print(f"Wrote print image: {print_path}")
+    if not args.no_pdf:
+        print(f"Wrote printable PDF: {pdf_path}")
